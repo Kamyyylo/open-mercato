@@ -386,9 +386,10 @@ describe('Queue - local strategy', () => {
       await queue.enqueue({ value: 1 })
       await queue.enqueue({ value: 2 })
 
-      // The invariant, asserted portably: queue.json is only ever created with
-      // the exclusive `wx` flag by ensureDir, never written in place. Every
-      // persist goes to a temp file that is then renamed over it.
+      // The invariant, asserted portably: queue.json is never written in place.
+      // ensureDir publishes it with a hard link (or, where links are missing,
+      // an exclusive `wx` create), and every persist goes to a temp file that
+      // is then renamed over it.
       const inPlaceWrites = writeFileSpy.mock.calls.filter(([target, , options]) => {
         if (typeof target !== 'string' || path.resolve(target) !== path.resolve(queuePath)) return false
         return (options as { flag?: string } | undefined)?.flag !== 'wx'
@@ -399,6 +400,84 @@ describe('Queue - local strategy', () => {
       expect(fs.readdirSync(queueDir).filter((fileName) => fileName.endsWith('.tmp'))).toEqual([])
     } finally {
       writeFileSpy.mockRestore()
+      await queue.close()
+    }
+  })
+
+  // Regression (#10630): ensureDir runs before the queue lock and used to
+  // create queue.json with an exclusive `writeFile`, which opens (and so
+  // publishes) an empty file before writing `[]` into it. Another instance
+  // already holding the lock read that empty file, failed to parse it and
+  // quarantined it, rejecting its own enqueue. The creating write is paused
+  // here between its open and its write to hold that window open.
+  test('an instance never reads the queue file while another one is still creating it', async () => {
+    const queueDir = path.join('.mercato', 'queue', 'creation-race-queue')
+    const queuePath = path.join(queueDir, 'queue.json')
+    const creator = createQueue<{ writer: string }>('creation-race-queue', 'local')
+    const reader = createQueue<{ writer: string }>('creation-race-queue', 'local')
+
+    const realWriteFile = fs.promises.writeFile.bind(fs.promises)
+    let markCreationPaused: () => void = () => {}
+    const creationPaused = new Promise<void>((resolve) => { markCreationPaused = resolve })
+    let resumeCreation: () => void = () => {}
+    const creationResumed = new Promise<void>((resolve) => { resumeCreation = resolve })
+    let creationIntercepted = false
+
+    const writeFileSpy = jest.spyOn(fs.promises, 'writeFile').mockImplementation(async (target, data, options) => {
+      const targetsQueueFile = typeof target === 'string' && path.basename(target).startsWith('queue.json')
+      if (creationIntercepted || !targetsQueueFile || typeof data !== 'string') {
+        return realWriteFile(target, data, options)
+      }
+      creationIntercepted = true
+      const flag = (options as { flag?: string } | undefined)?.flag ?? 'w'
+      const handle = await fs.promises.open(target as string, flag)
+      try {
+        markCreationPaused()
+        await creationResumed
+        await handle.writeFile(data, 'utf8')
+      } finally {
+        await handle.close()
+      }
+    })
+
+    try {
+      const creatorEnqueue = creator.enqueue({ writer: 'creator' })
+      await within(creationPaused, 5000)
+
+      await expect(within(reader.enqueue({ writer: 'reader' }), 5000)).resolves.toEqual(expect.any(String))
+
+      resumeCreation()
+      await within(creatorEnqueue, 5000)
+
+      const stored = readJson(queuePath)
+      expect(stored.map((job: QueuedJob<{ writer: string }>) => job.payload.writer).sort()).toEqual(['creator', 'reader'])
+      const strayFiles = fs.readdirSync(queueDir)
+        .filter((fileName) => fileName.startsWith('queue.corrupted.') || fileName.endsWith('.tmp'))
+      expect(strayFiles).toEqual([])
+    } finally {
+      resumeCreation()
+      writeFileSpy.mockRestore()
+      await creator.close()
+      await reader.close()
+    }
+  })
+
+  test('creates the queue files without hard links on filesystems that lack them', async () => {
+    const queueDir = path.join('.mercato', 'queue', 'no-link-queue')
+    const queue = createQueue<{ value: number }>('no-link-queue', 'local')
+    const linkSpy = jest.spyOn(fs.promises, 'link').mockRejectedValue(
+      Object.assign(new Error('operation not permitted'), { code: 'EPERM' }),
+    )
+
+    try {
+      await queue.enqueue({ value: 1 })
+
+      expect(linkSpy).toHaveBeenCalled()
+      expect(readJson(path.join(queueDir, 'queue.json'))).toHaveLength(1)
+      expect(readJson(path.join(queueDir, 'state.json'))).toEqual({})
+      expect(fs.readdirSync(queueDir).filter((fileName) => fileName.endsWith('.tmp'))).toEqual([])
+    } finally {
+      linkSpy.mockRestore()
       await queue.close()
     }
   })
@@ -440,9 +519,13 @@ describe('Queue - local strategy', () => {
     const realWriteFile = fs.promises.writeFile
     const writeFileSpy = jest.spyOn(fs.promises, 'writeFile').mockImplementation(
       async (target: any, content: any, options: any) => {
-        // Stall inside the critical section: the temp file is only ever written
-        // while this queue holds the lock.
-        if (typeof target === 'string' && target.endsWith('.tmp')) await stalled
+        // Stall inside the critical section: a persist writes its temp file only
+        // while this queue holds the lock. The exclusive (`wx`) temp file that
+        // creates a missing queue file is written before the lock is taken.
+        const isPersistTempFile = typeof target === 'string'
+          && target.endsWith('.tmp')
+          && options?.flag !== 'wx'
+        if (isPersistTempFile) await stalled
         return realWriteFile(target, content, options)
       },
     )

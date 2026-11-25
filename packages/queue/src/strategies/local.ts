@@ -106,6 +106,7 @@ const LOCK_RETRY_MIN_MS = 2
 const LOCK_RETRY_MAX_MS = 20
 const RENAME_MAX_RETRIES = 5
 const RENAME_RETRY_BASE_MS = 10
+const HARD_LINK_UNSUPPORTED_CODES = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EXDEV'])
 
 const fsp = fs.promises
 
@@ -400,17 +401,48 @@ export function createLocalQueue<T = unknown>(
       if (error.code !== 'EEXIST') throw error
     }
 
-    // Initialize queue file with exclusive create flag
+    await createFileIfMissing(queueFile, '[]')
+    await createFileIfMissing(stateFile, '{}')
+  }
+
+  /**
+   * Creates `targetFile` with `content` unless it already exists, without ever exposing it
+   * half-written. `ensureDir` runs before the queue lock is taken, so a plain exclusive `writeFile`
+   * here leaves an empty `queue.json` on disk between its `open` and its `write`, and another
+   * instance already inside the lock reads that empty file, fails to parse it and quarantines it.
+   * Writing a temp file and hard-linking it into place publishes the complete document in one
+   * step, and `link` fails with `EEXIST` instead of replacing a file someone else created first.
+   */
+  async function createFileIfMissing(targetFile: string, content: string): Promise<void> {
     try {
-      await fsp.writeFile(queueFile, '[]', { encoding: 'utf8', flag: 'wx' })
+      await fsp.access(targetFile)
+      return
     } catch (e: unknown) {
       const error = e as NodeJS.ErrnoException
-      if (error.code !== 'EEXIST') throw error
+      if (error.code !== 'ENOENT') throw error
     }
 
-    // Initialize state file with exclusive create flag
+    const tempFile = `${targetFile}.${crypto.randomUUID()}.tmp`
     try {
-      await fsp.writeFile(stateFile, '{}', { encoding: 'utf8', flag: 'wx' })
+      await fsp.writeFile(tempFile, content, { encoding: 'utf8', flag: 'wx' })
+      await fsp.link(tempFile, targetFile)
+    } catch (e: unknown) {
+      const error = e as NodeJS.ErrnoException
+      if (error.code === 'EEXIST') return
+      if (!error.code || !HARD_LINK_UNSUPPORTED_CODES.has(error.code)) throw error
+      await createFileExclusively(targetFile, content)
+    } finally {
+      await fsp.rm(tempFile, { force: true }).catch(() => {})
+    }
+  }
+
+  /**
+   * Fallback for filesystems without hard links. It still never replaces an existing file, but the
+   * new file is briefly empty, so it is used only where `link` is not available.
+   */
+  async function createFileExclusively(targetFile: string, content: string): Promise<void> {
+    try {
+      await fsp.writeFile(targetFile, content, { encoding: 'utf8', flag: 'wx' })
     } catch (e: unknown) {
       const error = e as NodeJS.ErrnoException
       if (error.code !== 'EEXIST') throw error
